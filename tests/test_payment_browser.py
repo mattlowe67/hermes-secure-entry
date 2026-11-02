@@ -1507,7 +1507,12 @@ class PaymentBrowserTests(unittest.TestCase):
                             break
                         except PermissionError:
                             time.sleep(0.1)
-                    bu._driven_daemons.discard(name)
+                    # 0.22.5 tracks per-daemon metadata in a dict; 0.22.1
+                    # used a set. This is disposable harness cleanup only.
+                    if isinstance(bu._driven_daemons, dict):
+                        bu._driven_daemons.pop(name, None)
+                    else:
+                        bu._driven_daemons.discard(name)
 
     def test_nonprimary_attachment_cleanup_and_wrong_frame_lineage(self):
         other = self.context.new_page()

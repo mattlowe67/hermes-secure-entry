@@ -100,7 +100,7 @@ Requires `plugins.isolation: in_process`. The bridge refuses host isolation, cro
 
 ## Install and activation
 
-Use **Hermes 0.22.1**; the manifest is bounded to `>=0.22.1,<0.22.2`. Python requirements are supplied by Hermes. The plugin declares no additional Python dependencies. Use the PM-prepared Hermes interpreter, not an unrelated system Python and not raw pip against the live runtime.
+Use **Hermes 0.22.1–0.22.5**; the manifest is bounded to `>=0.22.1,<0.22.6`. Version 0.5.15 revalidates the native registered vault actions and callbacks on the actual selected 0.22.5 runtime; see [compatibility evidence](docs/hermes-0.22.5.md). Python requirements are supplied by Hermes. The plugin declares no additional Python dependencies. Use the PM-prepared Hermes interpreter, not an unrelated system Python and not raw pip against the live runtime.
 
 ### Direct GitHub install (supported Hermes CLI)
 
@@ -137,7 +137,7 @@ hermes plugins capabilities secure-entry
 
 Or add `--enable` to the source staging command. Set `plugins.isolation` to `in_process` and configure the separate Tailscale Serve route as above. There is no tool-override grant. Plugin capability declarations are empty because it requests none of Hermes's capability-gated host facades; enabling it still trusts in-process native vault writes, native direct-message dispatch and the local listener. **A separately coordinated gateway restart/new process and new conversation are required. The installer does not restart anything.** Do not overwrite an active installed copy: middleware/hooks can hotload into existing sessions even when tool schemas are deferred. This release does not claim a safe live new-session-only activation gate.
 
-`HERMES_HOME/plugins` survives normal Hermes updates; never put this plugin in the core checkout. This release is constrained to `>=0.22.1,<0.22.2`: the tested Hermes 0.22.1 consolidated vault-action contract, not a blanket promise about future releases. Rerun doctor and tests after host updates. It has no self-updater or dependency mutation path. See [the compatibility evidence and coordinated activation procedure](docs/hermes-0.22.1.md). Do not copy this upgrade over a running gateway's installed middleware.
+`HERMES_HOME/plugins` survives normal Hermes updates; never put this plugin in the core checkout. This release is constrained to `>=0.22.1,<0.22.6`: the tested Hermes 0.22.1 and 0.22.5 consolidated vault-action contracts, not a blanket promise about future releases. Rerun doctor and tests after host updates. It has no self-updater or dependency mutation path. See [the compatibility evidence and coordinated activation procedure](docs/hermes-0.22.1.md). Do not copy this upgrade over a running gateway's installed middleware.
 
 ## Related Hermes core fixes
 
