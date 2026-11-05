@@ -16,10 +16,10 @@ import unittest
 import urllib.parse
 import urllib.request
 from contextlib import ExitStack
-from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
-from gateway.authz_mixin import GatewayAuthorizationMixin
+from gateway.run import GatewayRunner
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.session import SessionSource, build_session_key
@@ -48,14 +48,16 @@ class TopicTests(unittest.TestCase):
         set_session_vars(**self.values)
         self.service = Service('https://example.invalid', str(get_hermes_home()), port=0)
         self.addCleanup(self.service.close)
-        self.service.bridge_dispatches = []
-        self.service.configure_bridge(lambda *a: self.fail('Topic capability reached model-tool dispatch'), 'in_process')
+        self.dispatch = Mock(side_effect=AssertionError('Topic capability reached model-tool dispatch'))
+        self.service.configure_bridge(self.dispatch, 'in_process')
+        self.addCleanup(self.dispatch.assert_not_called)
         self.ctx = PluginContext(PluginManifest(name='synthetic-topic-bridge'), get_plugin_manager())
         self.lease = self.ctx.register_middleware('tool_execution', self.service.middleware)
         self.addCleanup(self.lease.dispose)
         self.sent = []
         self.delivered = threading.Event()
         self.delivery_error = None
+        self.delivery_message_id = 'synthetic-message'
         case = self
         class Adapter(BasePlatformAdapter):
             async def connect(self, **kwargs): return True
@@ -66,20 +68,16 @@ class TopicTests(unittest.TestCase):
                 case.delivered.set()
                 if case.delivery_error:
                     raise case.delivery_error
-                return SendResult(success=True, message_id='synthetic-message')
+                return SendResult(success=True, message_id=case.delivery_message_id)
         self.config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token='SYNTHETIC-TOKEN')})
         self.adapter = Adapter(self.config.platforms[Platform.TELEGRAM], Platform.TELEGRAM)
-        class Runner(GatewayAuthorizationMixin):
-            def _get_cached_session_source(inner, key): return inner.sources.get(key)
-            def _session_key_for_source(inner, source): return build_session_key(source, profile=source.profile)
-            def _is_user_authorized_for_source(inner, source): return inner._is_user_authorized(source)
-        self.runner = Runner()
+        # Use the pinned gateway's actual cache, key derivation and profile-aware
+        # authorization seams. Bypass only construction/startup of a live gateway.
+        self.runner = object.__new__(GatewayRunner)
         self.runner.config = self.config
         self.runner.adapters = {Platform.TELEGRAM: self.adapter}
-        self.runner.sources = {self.key: self.source}
-        run = ModuleType('gateway.run')
-        run._gateway_runner_ref = lambda: self.runner
-        self.stack.enter_context(patch.dict(sys.modules, {'gateway.run': run}))
+        self.runner._cache_session_source(self.key, self.source)
+        self.stack.enter_context(patch('gateway.run._gateway_runner_ref', return_value=self.runner))
         self.stack.enter_context(patch.dict(os.environ, {'TELEGRAM_ALLOWED_USERS': self.source.user_id,
             'TELEGRAM_GROUP_ALLOWED_USERS': '', 'TELEGRAM_GROUP_ALLOWED_CHATS': '',
             'GATEWAY_ALLOWED_USERS': '', 'GATEWAY_ALLOW_ALL_USERS': '', 'TELEGRAM_ALLOW_ALL_USERS': ''}))
@@ -93,6 +91,12 @@ class TopicTests(unittest.TestCase):
         # A tripwire, not a suppressed mirror: a capability must never reach this API.
         self.mirror = self.stack.enter_context(patch('gateway.mirror.mirror_to_session',
             side_effect=AssertionError('private capability reached transcript mirror')))
+        self.native_mirror = self.stack.enter_context(patch('tools.send_message_tool._mirror_sent_message',
+            side_effect=AssertionError('private capability entered native mirror')))
+        # Assert even on cancellation cases, where a throwing tripwire alone
+        # could be swallowed by the fail-closed delivery boundary.
+        self.addCleanup(self.mirror.assert_not_called)
+        self.addCleanup(self.native_mirror.assert_not_called)
         self.log = io.StringIO()
         handler = logging.StreamHandler(self.log)
         logging.getLogger().addHandler(handler)
@@ -204,27 +208,175 @@ class TopicTests(unittest.TestCase):
         denied(session_id='other')
         denied(task_id='')
         with delegated_child_context(): denied()
-        self.runner.sources[self.key] = dataclasses.replace(self.source, is_bot=True)
+        self.runner._cache_session_source(self.key, dataclasses.replace(self.source, is_bot=True))
         denied()
-        self.runner.sources.clear()
+        self.runner._session_sources.clear()
         denied()
         self.assertFalse(self.sent)
         self.assertIsNone(self.service.server)
 
     def test_changed_source_before_handoff_revokes_without_native_write(self):
+        # The valid HTTP bearer is not sufficient when the initiating source or
+        # its authorization changed during the wait, including the same sender's
+        # next message. Exercise the real owner/auth check at the handoff fence.
+        changes = ({'message_id': '302'}, {'profile': 'other'}, {'thread_id': '18'},
+            {'user_id': '123450002'}, {'chat_id': '-1001234500002'},
+            {'profile_route_rejected': True}, {'is_bot': True}, None, 'authorization')
+        for change in changes:
+            with self.subTest(change=change), patch.dict(os.environ, {}):
+                self.runner._cache_session_source(self.key, self.source)
+                self.delivered.clear()
+                index = len(self.sent)
+                consumed = []
+                def consumer(args):
+                    consumed.append(unlock.get_code_prompt_callback()('synthetic.example', ''))
+                    return json.dumps({'success': consumed[-1] is not None})
+                t, results, errors = self.worker(lambda: self.call(fn=consumer))
+                self.assertTrue(self.delivered.wait(3))
+                if change is None:
+                    self.runner._session_sources.clear()
+                elif change == 'authorization':
+                    os.environ['TELEGRAM_ALLOWED_USERS'] = '123459999'
+                else:
+                    self.runner._cache_session_source(self.key, dataclasses.replace(self.source, **change))
+                token, _, _ = self.post(index=index)
+                t.join(5)
+                self.assertFalse(t.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(consumed, [None])
+                self.assertEqual(json.loads(results[0])['status'], 'cancelled')
+                self.assertEqual(self.service.broker.status(token)['status'], 'cancelled')
+                self.assertNotIn(token, str(results) + self.log.getvalue())
+                self.assertEqual(self.service.bridge.topic_scopes, {})
+
+    def test_source_replacement_before_prompt_never_issues_or_sends(self):
+        consumed = []
+        def consumer(args):
+            self.runner._cache_session_source(self.key, dataclasses.replace(self.source, message_id='302'))
+            consumed.append(unlock.get_code_prompt_callback()('synthetic.example', ''))
+            return json.dumps({'success': consumed[-1] is not None})
+        result = self.call(fn=consumer)
+        self.assertEqual(consumed, [None])
+        self.assertFalse(json.loads(result)['success'])
+        self.assertFalse(self.service.broker.requests)
+        self.assertIsNone(self.service.server)
+        self.assertFalse(self.sent)
+
+    def test_source_replacement_after_issue_never_reaches_transport(self):
+        issue = self.service.broker.issue
+        def replace_source(*args, **kwargs):
+            request = issue(*args, **kwargs)
+            self.runner._cache_session_source(self.key, dataclasses.replace(self.source, message_id='302'))
+            return request
+        consumed = []
+        def consumer(args):
+            consumed.append(unlock.get_code_prompt_callback()('synthetic.example', ''))
+            return json.dumps({'success': consumed[-1] is not None})
+        # Inject a deterministic race at the real issue/delivery boundary; do
+        # not replace the owner validator, transport policy or broker behavior.
+        with patch.object(self.service.broker, 'issue', side_effect=replace_source):
+            result = self.call(fn=consumer)
+        self.assertEqual(consumed, [None])
+        self.assertEqual(json.loads(result)['status'], 'cancelled')
+        self.assertEqual(len(self.service.broker.requests), 1)
+        self.assertEqual(next(iter(self.service.broker.requests.values())).status, 'cancelled')
+        self.assertFalse(self.sent)
+        self.mirror.assert_not_called()
+
+    def test_stop_during_transport_revokes_even_if_delivery_later_succeeds(self):
+        entered, release = threading.Event(), threading.Event()
+        send = self.adapter.send
+        async def blocked_send(**kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError('synthetic transport barrier')
+            return await send(**kwargs)
+        consumed = []
+        def consumer(args):
+            consumed.append(unlock.get_code_prompt_callback()('synthetic.example', ''))
+            return json.dumps({'success': consumed[-1] is not None})
+        with patch.object(self.adapter, 'send', side_effect=blocked_send):
+            t, results, errors = self.worker(lambda: self.call(fn=consumer))
+            try:
+                self.assertTrue(entered.wait(3))
+                self.service.stopped(session_key=self.key)
+            finally:
+                release.set()
+            t.join(5)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(consumed, [None])
+        self.assertEqual(json.loads(results[0])['status'], 'cancelled')
+        self.assertEqual(len(self.sent), 1)
+        token = self.sent[0]['content'].split()[-1].rsplit('/', 1)[-1]
+        request = self.service.broker.requests[token]
+        self.assertEqual(self.service.broker.submit(token, {'csrf': request.csrf,
+            'action': 'submit', 'code': 'SYNTHETIC-LATE'})['status'], 'cancelled')
+        self.assertEqual(self.service.bridge.topic_scopes, {})
+        self.mirror.assert_not_called()
+
+    def test_equivalent_cache_copy_and_normal_turn_end_do_not_cancel_waiter(self):
         consumed = []
         def consumer(args):
             consumed.append(unlock.get_code_prompt_callback()('synthetic.example', ''))
             return json.dumps({'success': consumed[-1] is not None})
         t, results, errors = self.worker(lambda: self.call(fn=consumer))
         self.assertTrue(self.delivered.wait(3))
-        self.runner.sources[self.key] = dataclasses.replace(self.source, message_id='302')
-        # A valid web submission must not be handed to a no-longer-bound task.
-        self.post()
+        # The native gateway caches dataclass copies, not source object identity.
+        self.runner._cache_session_source(self.key, self.source)
+        self.service.ended(turn_id='synthetic-turn', completed=True,
+            session_key=self.key, session_id=self.values['session_id'])
+        self.post(value='SYNTHETIC-UNCHANGED')
         t.join(5)
+        self.assertFalse(t.is_alive())
         self.assertEqual(errors, [])
-        self.assertEqual(consumed, [None])
-        self.assertEqual(json.loads(results[0])['status'], 'cancelled')
+        self.assertEqual(consumed, ['SYNTHETIC-UNCHANGED'])
+        self.assertEqual(json.loads(results[0])['status'], 'filled')
+        self.assertEqual(self.service.bridge.topic_scopes, {})
+
+    def test_same_sender_reset_only_cancels_old_topic_while_other_callback_starts(self):
+        # Topic 2 is admitted, but has not issued a request when topic 1 resets.
+        # Indexing only issued requests (or using a global generation at prompt)
+        # would either miss the targeted callback or cancel the unrelated topic.
+        source2 = dataclasses.replace(self.source, thread_id='18', message_id='302')
+        key2 = build_session_key(source2, profile=self.profile)
+        self.runner._cache_session_source(key2, source2)
+        values2 = {**self.values, 'thread_id': '18', 'message_id': '302',
+            'session_key': key2, 'session_id': 'synthetic-topic-session-2'}
+        entered, release = threading.Event(), threading.Event()
+        consumed = [[], []]
+        def consumer(index):
+            def run(args):
+                if index == 1:
+                    entered.set()
+                    if not release.wait(5):
+                        raise TimeoutError('synthetic callback barrier')
+                consumed[index].append(unlock.get_code_prompt_callback()('synthetic.example', ''))
+                return json.dumps({'success': consumed[index][-1] is not None})
+            return run
+        t1, result1, error1 = self.worker(lambda: self.call(fn=consumer(0)))
+        self.assertTrue(self.delivered.wait(3))
+        self.delivered.clear()
+        def second():
+            set_session_vars(**values2)
+            return self.call(fn=consumer(1), session_id=values2['session_id'], task_id='synthetic-task-2')
+        t2, result2, error2 = self.worker(second)
+        try:
+            self.assertTrue(entered.wait(3))
+            self.service.reset(old_session_id=self.values['session_id'], session_id='synthetic-new-session')
+        finally:
+            release.set()
+        self.post(index=1, value='SYNTHETIC-SECOND')
+        t1.join(5)
+        t2.join(5)
+        self.assertFalse(t1.is_alive() or t2.is_alive())
+        self.assertEqual(error1 + error2, [])
+        self.assertEqual(consumed, [[None], ['SYNTHETIC-SECOND']])
+        self.assertEqual(json.loads(result1[0])['status'], 'cancelled')
+        self.assertEqual(json.loads(result2[0])['status'], 'filled')
+        self.assertEqual([sent['chat_id'] for sent in self.sent], [self.source.user_id] * 2)
+        self.assertEqual(self.service.bridge.topic_scopes, {})
+        self.mirror.assert_not_called()
 
     def test_unauthorized_sender_never_enters_native(self):
         with patch.dict(os.environ, {'TELEGRAM_ALLOWED_USERS': '123459999'}):
@@ -234,17 +386,34 @@ class TopicTests(unittest.TestCase):
         self.assertEqual(json.loads(result)['status'], 'unavailable')
 
     def test_failed_or_ambiguous_dm_cancels_once_without_fallback_or_logging(self):
-        self.delivery_error = TimeoutError('SYNTHETIC-SECRET-ERROR')
-        def consumer(args):
-            self.assertIsNone(unlock.get_code_prompt_callback()('synthetic.example', ''))
-            return json.dumps({'success': False})
-        result = self.call(fn=consumer)
-        self.assertEqual(len(self.sent), 1)
-        self.assertEqual(self.sent[0]['chat_id'], self.source.user_id)
-        self.assertEqual(json.loads(result)['status'], 'cancelled')
-        self.assertTrue(all(r.status == 'cancelled' for r in self.service.broker.requests.values()))
-        self.assertNotIn('SYNTHETIC-SECRET-ERROR', result + self.log.getvalue())
-        self.mirror.assert_not_called()
+        from telegram.error import Forbidden, NetworkError, RetryAfter, TimedOut
+        # Unlike a timeout, 429 and 5xx are retried by the native helper unless
+        # the topic path explicitly requests one attempt. No ACK is ambiguous.
+        outcomes = (TimeoutError('SYNTHETIC-SECRET-ERROR'),
+            TimedOut('SYNTHETIC-SECRET-ERROR'), Forbidden('SYNTHETIC-SECRET-ERROR'),
+            NetworkError('503 SYNTHETIC-SECRET-ERROR'), RetryAfter(0), None)
+        for outcome in outcomes:
+            with self.subTest(outcome=type(outcome).__name__):
+                self.delivery_error = outcome
+                self.delivery_message_id = None if outcome is None else 'synthetic-message'
+                index = len(self.sent)
+                consumed = []
+                def consumer(args):
+                    consumed.append(unlock.get_code_prompt_callback()('synthetic.example', ''))
+                    return json.dumps({'success': consumed[-1] is not None})
+                result = self.call(fn=consumer)
+                self.assertEqual(consumed, [None])
+                self.assertEqual(len(self.sent), index + 1)
+                self.assertEqual(self.sent[index]['chat_id'], self.source.user_id)
+                self.assertEqual(json.loads(result)['status'], 'cancelled')
+                token = self.sent[index]['content'].split()[-1].rsplit('/', 1)[-1]
+                request = self.service.broker.requests[token]
+                self.assertEqual(request.status, 'cancelled')
+                self.assertEqual(self.service.broker.submit(token, {'csrf': request.csrf,
+                    'action': 'submit', 'code': 'SYNTHETIC-LATE'})['status'], 'cancelled')
+                self.assertNotIn('SYNTHETIC-SECRET-ERROR', result + self.log.getvalue())
+                self.assertNotIn(token, result + self.log.getvalue())
+                self.mirror.assert_not_called()
 
     def test_lifecycle_expiry_cancel_session_end_and_unload(self):
         # Each branch gets a fresh request and uses the existing native callback.
@@ -280,7 +449,7 @@ class TopicTests(unittest.TestCase):
     def test_simultaneous_topics_users_and_sessions_do_not_cross(self):
         source2 = dataclasses.replace(self.source, user_id='123450002', thread_id='18', message_id='302')
         key2 = build_session_key(source2, profile=self.profile)
-        self.runner.sources[key2] = source2
+        self.runner._cache_session_source(key2, source2)
         values2 = {**self.values, 'user_id': source2.user_id, 'thread_id': source2.thread_id,
             'message_id': source2.message_id, 'session_key': key2, 'session_id': 'synthetic-topic-session-2'}
         consumed = [[], []]

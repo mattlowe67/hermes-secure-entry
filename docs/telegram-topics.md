@@ -1,71 +1,164 @@
-# Telegram topic → requester DM native bridge (local fork)
+# Telegram topic → requester DM native bridge
 
-`0.5.15+topics.1`, based on upstream `44a36874a4fd3e81a1eec6591dea87bf92f5436e`.
-No core patch, deployment, restart, real account, or live secret test is included.
+The bridge admits a narrow set of native vault actions from an authorized Telegram
+forum topic and sends any private-entry capability only to the requesting human's
+DM. The original topic's native browser task continues; it is not moved to the DM.
+No Hermes core patch is bundled. Standalone entry and payment tools remain DM-only.
 
-## Scope and trust
+## Scope and authorization
 
-- Only `browser_vault action=enter_code` (without a handle), `list`, and `unlock`
-  gain topic admission. List/unlock support the native login workflow; standalone
-  add-login/card, payment, remove-card, status and cancel tools stay DM-only.
-- Native gateway task-local identity must match the current cached authenticated
-  source, including home/profile, platform, group chat, real sender, topic,
-  initiating message, session key and session ID. The middleware task ID is
-  retained separately; the native browser call is not rebound to the DM.
-- Only Telegram `group` sources with a positive numeric thread and human sender
-  qualify. Anonymous-admin/channel sentinels, bots, channel actors, missing
-  bindings, cron/headless/delegated contexts, rejected routes and mismatches fail
-  closed. Native gateway authorization is rechecked before issuance/delivery and
-  before handing submitted input to the waiting native callback.
-- Destination is exclusively the authenticated sender's numeric Telegram ID.
-  No model-supplied destination is accepted. Start the bot in that user's DM first;
-  a blocked/unreachable DM cancels the request without a group fallback or retry.
-- The link is a short-lived bearer capability. **Tailscale access + possession of
-  the link**, not phone identity or Telegram authentication of the web submitter,
-  authorizes submission. A recipient can forward it; this is not prevented.
-- The web input enters only the existing native prompt callback, never model/tool
-  arguments. The original topic worker continues; browser task identity is unchanged.
-- Expiry, one-use/CSRF checks, web Cancel, delivered stop/reset/session-end hooks,
-  interrupt and unload fences remain. Once handed to native code, cancellation
-  cannot promise no write. Stop/reset of one active topic does not cancel another
-  active topic's callback. Admission races remain conservatively fail-closed.
-- A newer message replacing the cached source, cache eviction, or changed gateway
-  authorization while waiting causes cancellation at handoff, even when the same
-  person sent the new message. Do not send another topic message while filling.
-  Normal successful turn-end does not itself mean session cancellation.
+- Only native `browser_vault(action="enter_code")` **without a handle**, `list`,
+  and `unlock` gain topic admission through this bridge. `list` returns native
+  metadata; it is not a secret collector. Treat metadata returned to the topic as
+  visible to that conversation. Standalone add-login/add-card, card fill/removal,
+  Link payment fill, and plugin status/cancel tools remain DM-only. Other native
+  browser actions keep their own native policy; this is not a general group grant.
+- Admission requires `plugins.isolation: in_process` and native task-local identity
+  matching the gateway's current cached authenticated source: home/profile,
+  platform, group chat, human sender, positive numeric topic and initiating-message
+  IDs, session key and session ID. The middleware task ID is retained separately.
+  Model arguments and process-environment identity alone cannot grant admission.
+- Only Telegram sources classified by Hermes as `group` with those bindings qualify.
+  Bots, anonymous-admin/channel actors, missing bindings, rejected routes,
+  cron/headless/delegated contexts and mismatches fail closed.
+- The plugin rechecks native gateway authorization before issuance, at delivery,
+  and before handing submitted input to the native callback. **A native group-chat
+  grant can authorize identified human members of that group**; this is not an
+  additional per-user allowlist or proof that the sender is separately authorized
+  for a DM conversation. Review group membership and native grants accordingly.
+- Delivery targets only the authenticated sender's numeric Telegram user ID. No
+  model-supplied destination is accepted. The user must first start the bot in a
+  private chat. A blocked/unreachable DM or ambiguous delivery result cancels the
+  request: there is no group fallback, alternate destination or retry.
+- The website uses **Tailscale access plus possession of the bearer link**, not
+  phone identity, Telegram login or the identity of the submitting person, as
+  submission authority. A recipient can forward the link; the plugin cannot
+  prevent this. Do not forward it or put it in shared logs.
 
-## Delivery and update coupling
+## Setup and use
 
-The native `send_message_tool` mirrors sent content through
-`_mirror_sent_message`/`gateway.mirror`; its Telegram formatting path also has
-retries. Topic capabilities must not enter either path. The plugin uses the SAME
-native active-profile config resolver, relay-egress guard and credential snapshot,
-then native `_telegram_bot` and `_send_telegram_message_with_retry(attempts=1)` with
-plain text and disabled previews. No tool dispatch, transcript mirror, adapter
-fallback or session-context rewriting occurs. Exceptions never leave this path as
-text. Existing DM behavior is intentionally unchanged and may mirror its links.
+1. Use a reviewed immutable plugin revision and a compatible Hermes source. Follow
+   [installation and coordinated activation](../README.md#install-and-activation);
+   install/enable alone is not proof that a running gateway has activated it.
+2. Configure the originating profile's native Telegram bot and authorization policy.
+   Review group grants and membership; do not loosen authorization to work around a
+   refusal. Have the requesting user start the bot in a private chat.
+3. Configure a dedicated, tailnet-only HTTPS root forwarded unchanged to the
+   loopback listener, as described in [Tailscale deployment](../README.md#tailscale-deployment-operator-owned).
+   The client device needs allowed tailnet access. Never use Funnel or a public proxy.
+4. From the authorized topic, inspect the intended page using native browser tools.
+   Use native `list` for metadata and, if needed, `unlock` for the genuine manager
+   master-password prompt. Use `enter_code` without a handle for a detected code
+   field. Native inspection, not a model-supplied site, arms the OTP form.
+5. Open the capability received in the requester's DM and enter the value on the
+   private page, never in Telegram messages or tool arguments. Do not send a new
+   topic message while filling: a newer cached initiating message can invalidate
+   the pending callback, even from the same sender.
+6. Check the resulting browser/manager state. `filled` reports a native fill,
+   **not website authentication**; `unlocked` reports a manager unlock, not login
+   to a website. No Submit/Continue click is added by the plugin, though a website
+   may auto-submit a filled code. App/passkey approval stays on the actual device.
 
-This is private-API coupling, NOT a promise of future update compatibility. The
-integration suite uses real Hermes middleware, native vault handler/callbacks,
-authorization and egress policy, with synthetic transport/supervisor and loopback
-HTTP. It was exercised against isolated Hermes 0.22.3 source
-`5b147ab036d6d19131bff8d20701b5001eab844a`. The inherited manifest version range does
-not imply this topic exception has been verified on every version in that range.
-Missing/changed private APIs fail closed. Review these contracts and rerun tests
-on every Hermes update; never solve breakage by disabling auth or editing core.
+## Expiry, cancellation and browser lifetime
 
-## Deployment checklist (operator/parent only)
+Callback waits share a deadline of at most **180 seconds across native execution**;
+opening the form does not restart it. GET/link previews are non-consuming. One-use,
+CSRF and expiry checks apply to submission, including received input not yet consumed.
+Use the web form's **Cancel** button for a topic request. Plugin status/cancel tools
+remain DM-only and cannot adopt a topic-owned request from a separate DM session.
 
-1. Independently review the uncommitted fork and tests, especially topic source
-   correlation, private send/egress and scoped lifecycle cancellation.
-2. Pin the reviewed fork revision and retain upstream rollback. Do not auto-update
-   the live plugin from a moving branch. Keep the existing trusted HTTPS/Tailscale
-   Serve origin and loopback listener; no public Funnel or group-link fallback.
-3. Coordinate plugin replacement/restart outside active requests. This work does
-   not perform deployment or change config.
-4. With explicit approval, test a dummy OTP from an authorized topic. Verify the
-   DM receives the link, topic/transcript gets no capability, and the original
-   browser task continues. Test blocked DM, cancellation, another user/topic and
-   a native existing DM before using a real login.
-5. Full upstream suite contains Windows-only private-card/ACL tests. On macOS those
-   are a validation blocker, not evidence of a topic failure or a passing full suite.
+Delivered stop/reset/abnormal-session-end hooks, interruption and unload cancel
+pending work. Normal successful turn-end is not itself a cancellation event.
+**Idle `/stop` is not reliable revocation** when Hermes emits no stop hook; use the
+web Cancel button, or coordinate service shutdown if a suspect link cannot be
+cancelled. Restart invalidates in-memory links. Matching active topic callbacks
+are scoped by session key/ID, so stopping one session does not intentionally stop
+another. Admission races are conservatively refused.
+
+Cached-source replacement/eviction or authorization changes can cancel at handoff,
+even after a valid web submission. Once input is handed to native code, status is
+`commit_unknown` until a verified native result; cancellation cannot promise to
+undo an action already started. Inspect the browser or manager before retrying.
+Native origin/inspection-nonce, redaction, supervisor and takeover checks remain
+in force. Native tab-selection ambiguity and same-origin DOM limitations remain;
+this bridge does not provide immutable browser target/frame/generation binding.
+
+## Delivery implementation and private-API dependencies
+
+Native `send_message_tool` can mirror sent content via `_mirror_sent_message` /
+`gateway.mirror`, and its Telegram formatting path can retry. The **topic** path
+bypasses tool dispatch and mirroring while retaining native active-profile config
+resolution, relay-egress authorization and a single credential snapshot. It uses
+native `_telegram_bot` and `_send_telegram_message_with_retry(attempts=1)`, plain
+text and disabled previews. Delivery failures expose no exception text through
+the bridge. **Existing DM delivery is unchanged and can mirror capability links
+into model-visible session history.** Neither path returns submitted secret values
+to the model; this is not a general transcript-free delivery claim.
+
+Private dependencies include the gateway runner reference, source cache,
+session-key derivation and authorization wrapper; native task-local identity,
+vault callbacks/middleware; and the native config/egress/Telegram helpers above.
+Missing dependencies or detected mismatches are refused, but changes to private
+semantics require review, not just import checks. Rerun tests on each Hermes
+update. Never repair compatibility by bypassing authorization, weakening egress,
+adding a group-link fallback or editing core to force admission.
+
+## Compatibility and evidence
+
+The manifest remains `>=0.22.1,<0.22.6`. This inherited range is **not evidence that
+this topic exception has been verified on every release in it**. Earlier topic
+pilot tests used Hermes source `5b147ab036d6d19131bff8d20701b5001eab844a` (0.22.3).
+The PR-preparation comparison instead uses the exact Windows workflow pin,
+`046094df28b712f62a5e3c728a9e59da05dcbf1e`, and isolated PM-built Python 3.14.6 on macOS:
+
+| Check | Recorded result |
+|---|---|
+| Focused candidate bridge/topic/DM compatibility tests | 109 passed, no skips; comparable upstream selection: 94 passed |
+| Topic-only suite | 15 passed, no skips, in each of three fresh processes |
+| Full unchanged upstream plugin suite | 282 tests; 20 failures, 23 errors, no skips |
+| Full candidate suite | 297 tests; 20 failures, 23 errors, no skips |
+
+The full-run failure/error heading multisets match, with no candidate-only heading;
+the shared Windows ACL/private-file/payment-path failures on macOS mean **neither
+full local suite is green**. Exact-candidate Windows CI is still required before
+publication. An upstream green run does not validate this candidate.
+
+Tests execute real pinned gateway cache/key/authorization methods, middleware,
+native vault handlers/callbacks, relay policy and Telegram retry primitive, with
+synthetic config, transport/supervisor and loopback HTTP. They cover source changes,
+revoked authorization, blocked/ambiguous delivery, no mirror/dispatch/fallback,
+expiry/cancellation and concurrent-topic isolation. The same-sender reset test
+proves an unrelated admitted callback survives another session's reset; it does
+not establish targeted pre-issuance cancellation. Log assertions cover collected
+WARNING-and-higher output, not DEBUG/INFO or every possible logging configuration.
+No production defect was reproduced or fixed by this test expansion.
+
+Separately, an operator reported a successful live sequence from a Telegram topic
+to a private web link, native fill and confirmed website login. No account details
+are needed for that observation. It is not exact-candidate Windows CI, a general
+security audit, live manager-unlock coverage, or proof of every cancellation/device
+scenario. Synthetic results are not live transport/browser evidence. See the
+[platform matrix](platforms.md) for the other transports.
+
+## Troubleshooting and rollback
+
+- No DM link: ensure the user started the configured bot privately and has not
+  blocked it. A failed or ambiguous send is cancelled, not retried; request a new
+  flow only after checking the prior browser outcome. Never post a fallback link
+  to the topic.
+- Expired/cancelled after opening: check the shared deadline, newer topic traffic,
+  delivered lifecycle events, source-cache changes and authorization policy.
+  Do not reuse the link or attempt to transfer it to a different session.
+- `admission_unavailable`: inspect isolation, task/session/profile correlation,
+  native authorization and lifecycle state using sanitized diagnostics. This is a
+  fixed refusal category, **not a diagnosis**. Intermittent live instances have
+  not been root-caused; do not relax checks or infer a credential problem.
+- Blank/reset browser or `no_code_field`: inspect the actual native browser/task
+  state and field recognition before creating another flow. Browser lifecycle
+  resets have been observed, but their cause is unresolved; this PR does not claim
+  a browser-reset fix. A native fill result alone cannot establish login.
+- Update/rollback: keep a known-good immutable payload. Outside active requests,
+  coordinate gateway stop/unload, supported plugin replacement, doctor/validation,
+  then a new process and conversation. Never overwrite running middleware. Restore
+  the previous reviewed revision to remove the topic exception; use the existing
+  DM workflow. Keep unrelated profiles, HTTPS routes and native auth policy intact.
