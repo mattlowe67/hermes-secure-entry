@@ -1,5 +1,16 @@
 # Security model
 
+## Local Telegram-topic exception (`0.5.15+topics.1`)
+
+The DM-only statements below remain applicable to standalone vault writes and
+payments. Only the native OTP/list/unlock bridge admits authenticated Telegram
+group topics; see [the exact contract](docs/telegram-topics.md). Topic capabilities
+use a separate non-mirroring, single-attempt native Telegram delivery path, never
+`send_message` tool dispatch. Existing DM delivery behavior is unchanged. The
+private page still trusts **Tailscale access plus possession of the bearer link**,
+not the phone's identity, Telegram login, or identity of the submitting person.
+Do not forward the link. The plugin does not patch Hermes core.
+
 ## Payment routes added after the original preview
 
 0.5.0 adds native `payment`-kind private card entry and explicit verified cleanup alongside the existing Link route. The real-card route resolves only a metadata-selected payment bound to the exact merchant, after genuine native consent for the retained merchant/payment-iframe pair; both sources use the existing captured native writer. Never pass secrets in tool arguments or use per-site browser scripts. The supported native schema **requires and encrypts CVC persistently**; the form discloses this. Nonpersistent one-use CVC is not implemented: no private crypto/storage surgery or login workaround is used. Do not use this route where CVC retention is prohibited; encryption is not a PCI compliance claim. Delete by the returned handle after verifying the intended checkout outcome or explicit cancellation. Unknown save/fill/delete outcomes require inspection. Cleanup verifies native metadata absence, not media erasure, browser copies, backups or merchant revocation; it cannot retract a started fill. See [complete payment contract and limitations](docs/real-card-payment.md). Original preview-only exclusions below do not exclude these narrowly implemented payment routes.

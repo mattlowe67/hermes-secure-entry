@@ -1,6 +1,12 @@
 # Hermes Secure Entry
 
 **Private credential entry from a messaging DM, over your own Tailscale network.**
+
+Local fork `0.5.15+topics.1` additionally supports native OTP/unlock from authenticated
+Telegram group topics, with the capability sent only to the requesting user's DM.
+Standalone vault writes and payment operations remain DM-only. See
+[topic bridge security, compatibility and deployment notes](docs/telegram-topics.md).
+This fork is not deployed or live-verified; no Hermes core changes are required.
 The agent sends a short-lived, one-use link; you enter the password, verification
 code, manager-unlock password or card in the private page rather than in chat.
 The plugin hands the secret to Hermes's native vault or waiting native callback
